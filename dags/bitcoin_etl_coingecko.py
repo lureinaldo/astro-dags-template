@@ -76,7 +76,7 @@ def fetch_bitcoin_history_from_coingecko():
     from airflow.providers.postgres.hooks.postgres import PostgresHook
     hook = PostgresHook(postgres_conn_id="postgres")
     engine = hook.get_sqlalchemy_engine()
-    df.to_sql("bitcoin_history", con=engine, if_exists="append", index=True)
+    df.to_sql("bitcoin_history_luciana", con=engine, if_exists="append", index=True)
 
 
 @dag(
