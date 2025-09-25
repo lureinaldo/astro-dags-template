@@ -12,7 +12,7 @@ import pandas as pd
 from airflow.providers.google.cloud.hooks.bigquery import BigQueryHook
 
 # ====== CONFIG ======
-GCP_PROJECT  = "hardy-messenger-229417"      # e.g., "my-gcp-project"
+GCP_PROJECT  = "bigquery-471718"      # e.g., "my-gcp-project"
 BQ_DATASET   = "crypto"                    # e.g., "crypto"
 BQ_TABLE     = "bitcoin_history_hourly"    # e.g., "bitcoin_history_hourly"
 BQ_LOCATION  = "US"                        # dataset location: "US" or "EU"
@@ -106,6 +106,7 @@ def fetch_and_to_gbq():
     schedule="0 0 * * *",  # daily at 00:00 UTC
     start_date=pendulum.datetime(2025, 9, 17, tz="UTC"),
     catchup=True,
+    max_active_runs=1,
     owner_links={
         "Alex Lopes": "mailto:alexlopespereira@gmail.com",
         "Open in Cloud IDE": "https://cloud.astronomer.io/cm3webulw15k701npm2uhu77t/cloud-ide/cm42rbvn10lqk01nlco70l0b8/cm44gkosq0tof01mxajutk86g",
