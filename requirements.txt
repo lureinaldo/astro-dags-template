@@ -3,3 +3,4 @@ pandas-gbq>=0.19.2
 google-cloud-bigquery>=3.17.0
 pyarrow>=16.0.0
 apache-airflow[google]
+pache-airflow-providers-google
