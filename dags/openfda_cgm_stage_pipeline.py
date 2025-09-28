@@ -16,7 +16,7 @@ from typing import Any, Dict, List
 GCP_PROJECT     = "bigquery-471718"          # seu projeto GCP
 BQ_DATASET      = "openfda"                  # dataset de destino
 BQ_TABLE_STAGE  = "cgm_device_events_stage"  # tabela "flat" (stage)
-BQ_TABLE_COUNT  = "cgm_device_events_daily"  # contagem diária final
+BQ_TABLE_COUNT  = "cgm_device_events_daily"  # contagem diária final (particionada)
 BQ_LOCATION     = "US"                       # região do dataset
 GCP_CONN_ID     = "google_cloud_default"     # conexão no Astronomer
 
@@ -93,8 +93,7 @@ def _ensure_dataset(client: bigquery.Client, project: str, dataset: str, locatio
     ds_id = f"{project}.{dataset}"
     ds = bigquery.Dataset(ds_id)
     ds.location = location
-    # exists_ok=True evita exceção se já existir
-    client.create_dataset(ds, exists_ok=True)
+    client.create_dataset(ds, exists_ok=True)  # idempotente
 
 # ========================= DAG =========================
 @dag(
@@ -137,127 +136,4 @@ def openfda_cgm_stage_pipeline():
                 }
                 payload = _openfda_get(base_url, params)
                 rows = payload.get("results", []) or []
-                all_rows.extend(rows)
-                total_dia += len(rows)
-                n_calls += 1
-                if len(rows) < limit:
-                    break
-                skip += limit
-                time.sleep(0.25)  # respeita rate limit
-            print(f"[fetch] {day}: {total_dia} registros.")
-            day = date.fromordinal(day.toordinal() + 1)
-        print(f"[fetch] Jan–Jun/2020: {n_calls} chamadas, {len(all_rows)} registros no total.")
-
-        # Normaliza
-        df = _to_flat_device(all_rows)
-        print(f"[normalize] linhas pós-normalização: {len(df)}")
-        if not df.empty:
-            print("[normalize] preview:\n", df.head(10).to_string(index=False))
-
-        # Cliente BigQuery
-        bq_hook = BigQueryHook(gcp_conn_id=GCP_CONN_ID, location=BQ_LOCATION)
-        client: bigquery.Client = bq_hook.get_client()
-        _ensure_dataset(client, GCP_PROJECT, BQ_DATASET, BQ_LOCATION)
-
-        # Esquema da STAGE
-        schema_stage = [
-            bigquery.SchemaField("report_number",     "STRING"),
-            bigquery.SchemaField("date_received",     "DATE"),
-            bigquery.SchemaField("event_type",        "STRING"),
-            bigquery.SchemaField("device_generic",    "STRING"),
-            bigquery.SchemaField("device_brand",      "STRING"),
-            bigquery.SchemaField("manufacturer_name", "STRING"),
-            bigquery.SchemaField("source_country",    "STRING"),
-        ]
-
-        # DataFrame vazio com colunas corretas, se necessário
-        if df.empty:
-            df = pd.DataFrame({f.name: pd.Series(dtype="object") for f in schema_stage})
-            # Ajusta tipos básicos
-            df = df.astype({"date_received": "datetime64[ns]"}).assign(
-                date_received=lambda x: pd.NaT
-            )
-
-        table_id_stage = f"{GCP_PROJECT}.{BQ_DATASET}.{BQ_TABLE_STAGE}"
-        job_config_stage = bigquery.LoadJobConfig(
-            schema=schema_stage,
-            write_disposition=bigquery.WriteDisposition.WRITE_TRUNCATE,
-        )
-        load_job = client.load_table_from_dataframe(
-            dataframe=df,
-            destination=table_id_stage,
-            job_config=job_config_stage,
-            location=BQ_LOCATION,
-        )
-        load_job.result()
-        print(f"[stage] Gravados {len(df)} registros em {table_id_stage}.")
-
-        return {
-            "start":  TEST_START.strftime("%Y-%m-%d"),
-            "end":    TEST_END.strftime("%Y-%m-%d"),
-            "generic": DEVICE_GENERIC,
-        }
-
-    @task(retries=0)
-    def build_daily_counts(meta: Dict[str, str]) -> None:
-        """
-        Agrega contagem diária a partir da STAGE e salva a tabela final.
-        """
-        start, end, generic = meta["start"], meta["end"], meta["generic"]
-
-        query_sql = f"""
-        SELECT
-          date_received AS day,
-          COUNT(*)      AS events,
-          '{generic}'   AS device_generic
-        FROM `{GCP_PROJECT}.{BQ_DATASET}.{BQ_TABLE_STAGE}`
-        WHERE date_received BETWEEN DATE('{start}') AND DATE('{end}')
-        GROUP BY day
-        ORDER BY day
-        """
-
-        # Cliente BigQuery
-        bq_hook = BigQueryHook(gcp_conn_id=GCP_CONN_ID, location=BQ_LOCATION)
-        client: bigquery.Client = bq_hook.get_client()
-        _ensure_dataset(client, GCP_PROJECT, BQ_DATASET, BQ_LOCATION)
-
-        # Executa a consulta e converte para DataFrame
-        query_job = client.query(query_sql, location=BQ_LOCATION)
-        df_counts = query_job.result().to_dataframe(create_bqstorage_client=False)
-
-        if df_counts.empty:
-            print("[counts] Nenhuma linha para agregar.")
-            df_counts = pd.DataFrame(
-                {"day": pd.Series(dtype="datetime64[ns]"),
-                 "events": pd.Series(dtype="int64"),
-                 "device_generic": pd.Series(dtype="object")}
-            )
-
-        schema_counts = [
-            bigquery.SchemaField("day",            "DATE"),
-            bigquery.SchemaField("events",         "INTEGER"),
-            bigquery.SchemaField("device_generic", "STRING"),
-        ]
-
-        table_id_counts = f"{GCP_PROJECT}.{BQ_DATASET}.{BQ_TABLE_COUNT}"
-        job_config_counts = bigquery.LoadJobConfig(
-            schema=schema_counts,
-            write_disposition=bigquery.WriteDisposition.WRITE_TRUNCATE,
-        )
-
-        # Ajusta tipo de 'day' para datetime, BigQuery converte para DATE
-        if not df_counts.empty:
-            df_counts["day"] = pd.to_datetime(df_counts["day"], errors="coerce")
-
-        load_job2 = client.load_table_from_dataframe(
-            dataframe=df_counts,
-            destination=table_id_counts,
-            job_config=job_config_counts,
-            location=BQ_LOCATION,
-        )
-        load_job2.result()
-        print(f"[counts] {len(df_counts)} linhas gravadas em {table_id_counts}.")
-
-    build_daily_counts(extract_transform_load())
-
-openfda_cgm_stage_pipeline()
+                all_rows.exte_
