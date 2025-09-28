@@ -20,7 +20,7 @@ import pendulum
 # =========================
 # Parâmetros editáveis
 # =========================
-PROJECT_ID = "SEU_PROJETO_GCP"         # ex.: "meu-projeto"
+PROJECT_ID = "bigquery-471718"         # ex.: "meu-projeto"
 DATASET    = "openfda"                 # dataset de destino
 TABLE      = "cgm_device_events_weekly"
 LOCATION   = "US"                      # região do seu dataset (ex.: "US", "EU", "southamerica-east1")
