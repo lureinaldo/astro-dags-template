@@ -13,18 +13,18 @@ from datetime import date
 from typing import Any, Dict, List
 
 # ========================= Config =========================
-GCP_PROJECT     = "bigquery-471718"                # seu projeto GCP
-BQ_DATASET      = "openfda"                        # dataset de destino
-BQ_TABLE_STAGE  = "cgm_device_events_stage"        # tabela "flat" (stage)
-BQ_TABLE_COUNT  = "cgm_device_events_daily"        # contagem diária final
-BQ_LOCATION     = "US"                             # região do dataset
-GCP_CONN_ID     = "google_cloud_default"           # conexão no Astronomer
+GCP_PROJECT     = "bigquery-471718"          # seu projeto GCP
+BQ_DATASET      = "openfda"                  # dataset de destino
+BQ_TABLE_STAGE  = "cgm_device_events_stage"  # tabela "flat" (stage)
+BQ_TABLE_COUNT  = "cgm_device_events_daily"  # contagem diária final
+BQ_LOCATION     = "US"                       # região do dataset
+GCP_CONN_ID     = "google_cloud_default"     # conexão no Astronomer
 
 # Jan -> Jun/2020 (inclusive)
 TEST_START = date(2020, 1, 1)
 TEST_END   = date(2020, 6, 30)
 
-DEVICE_GENERIC = "continuous glucose"              # filtro do dispositivo
+DEVICE_GENERIC = "continuous glucose"        # filtro do dispositivo
 
 TIMEOUT_S   = 30
 MAX_RETRIES = 3
@@ -146,7 +146,7 @@ def openfda_cgm_stage_pipeline():
         if not df.empty:
             print("[normalize] preview:\n", df.head(10).to_string(index=False))
 
-        # Preparação de credenciais e criação de dataset (se não existir)
+        # Credenciais BigQuery
         bq = BigQueryHook(gcp_conn_id=GCP_CONN_ID, location=BQ_LOCATION)
         creds = bq.get_credentials()
 
@@ -178,8 +178,8 @@ def openfda_cgm_stage_pipeline():
         print(f"[stage] Gravados {len(df)} registros em {GCP_PROJECT}.{BQ_DATASET}.{BQ_TABLE_STAGE}.")
 
         return {
-            "start": TEST_START.strftime("%Y-%m-%d"),
-            "end":   TEST_END.strftime("%Y-%m-%d"),
+            "start":  TEST_START.strftime("%Y-%m-%d"),
+            "end":    TEST_END.strftime("%Y-%m-%d"),
             "generic": DEVICE_GENERIC,
         }
 
@@ -190,7 +190,7 @@ def openfda_cgm_stage_pipeline():
         """
         start, end, generic = meta["start"], meta["end"], meta["generic"]
 
-        sql = f"""
+        query_sql = f"""
         SELECT
           date_received AS day,
           COUNT(*)      AS events,
@@ -204,13 +204,12 @@ def openfda_cgm_stage_pipeline():
         bq = BigQueryHook(gcp_conn_id=GCP_CONN_ID, location=BQ_LOCATION)
         creds = bq.get_credentials()
 
+        # CORREÇÃO: usar parâmetro 'query' (não 'sql') e remover args opcionais frágeis
         df_counts = pandas_gbq.read_gbq(
-            sql=sql,
+            query=query_sql,
             project_id=GCP_PROJECT,
             credentials=creds,
-            dialect="standard",
             location=BQ_LOCATION,
-            progress_bar_type=None,
         )
 
         if df_counts.empty:
