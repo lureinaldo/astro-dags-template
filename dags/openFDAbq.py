@@ -21,67 +21,56 @@ import requests
 # =========================
 # Parâmetros editáveis
 # =========================
-PROJECT_ID = "bigquery-471718"          # ajuste conforme seu projeto GCP
-DATASET    = "openfda"                  # dataset de destino
-TABLE      = "cgm_device_events_weekly" # tabela de destino
-LOCATION   = "US"                       # região do dataset (ex.: "US", "EU", "southamerica-east1")
-GCP_CONN_ID = "google_cloud_default"    # conn_id com chave JSON
+PROJECT_ID  = "bigquery-471718"          # seu projeto GCP
+DATASET     = "openfda"                  # dataset destino
+TABLE       = "cgm_device_events_weekly" # tabela destino
+LOCATION    = "US"                       # região do dataset (US/EU/southamerica-east1)
+GCP_CONN_ID = "google_cloud_default"     # conexão com chave JSON
 
 API_HOST = "https://api.fda.gov"
 ENDPOINT = "device/event.json"
-GENERIC_NAME_QUERY = 'device.generic_name:%22continuous+glucose%22'  # Continuous Glucose Monitors
+GENERIC_NAME_QUERY = 'device.generic_name:%22continuous+glucose%22'
 
 # =========================
 # Utilidades de datas
 # =========================
 def last_day_of_month(year: int, month: int) -> int:
-    """Retorna o último dia do mês/ano informados."""
-    d = datetime(year, month, 28) + timedelta(days=4)   # cai no mês seguinte
-    return (d.replace(day=1) - timedelta(days=1)).day   # volta para o último dia do mês alvo
+    d = datetime(year, month, 28) + timedelta(days=4)
+    return (d.replace(day=1) - timedelta(days=1)).day
 
-# =========================
-# Monta URL de consulta
-# =========================
 def generate_query_url(year: int, month: int) -> tuple[str, str, str]:
     start_date = f"{year}{month:02d}01"
-    end_date = f"{year}{month:02d}{last_day_of_month(year, month):02d}"
-    query = (
+    end_date   = f"{year}{month:02d}{last_day_of_month(year, month):02d}"
+    url = (
         f"{API_HOST}/{ENDPOINT}"
         f"?search={GENERIC_NAME_QUERY}"
         f"+AND+date_received:[{start_date}+TO+{end_date}]"
         f"&count=date_received"
     )
-    return query, start_date, end_date
+    return url, start_date, end_date
 
 # =========================
 # Task: extrair e agregar semanal
 # =========================
 def fetch_openfda_data() -> None:
-    """
-    Obtém o mês/ano do logical_date, consulta device/event com count=date_received,
-    agrega por semana (W-MON) e publica no XCom um dicionário com:
-      - rows: [{week_start, week_end, events}, ...]
-      - window_start, window_end, endpoint, filter
-    """
     ctx = get_current_context()
     ti = ctx["ti"]
-    logical_date = ctx["logical_date"]  # pendulum DateTime
-    year = logical_date.year
-    month = logical_date.month
+    logical_date = ctx["logical_date"]    # pendulum DateTime
+    year, month = logical_date.year, logical_date.month
 
     url, start_yyyymmdd, end_yyyymmdd = generate_query_url(year, month)
     resp = requests.get(url, timeout=30)
+
     if resp.status_code != 200:
         ti.xcom_push(key="openfda_weekly", value=[])
         return
 
-    payload = resp.json()
-    results = payload.get("results", [])
+    results = resp.json().get("results", [])
     if not results:
         ti.xcom_push(key="openfda_weekly", value=[])
         return
 
-    df = pd.DataFrame(results)  # colunas: ["time","count"]
+    df = pd.DataFrame(results)                  # ["time","count"]
     df["time"] = pd.to_datetime(df["time"], format="%Y%m%d")
 
     weekly = (
@@ -116,7 +105,7 @@ def fetch_openfda_data() -> None:
     )
 
 # =========================
-# Task: criar dataset/tabela no BigQuery
+# DDL de criação no BigQuery
 # =========================
 def bq_create_sql() -> str:
     return f"""
@@ -136,7 +125,7 @@ def bq_create_sql() -> str:
     """
 
 # =========================
-# Definição da DAG (Airflow 3)
+# DAG (Airflow 3)
 # =========================
 default_args = {
     "owner": "airflow",
@@ -149,15 +138,15 @@ dag = DAG(
     dag_id="openfda_cgm_weekly_to_bq",
     default_args=default_args,
     description="OpenFDA device/event (CGM) → weekly → BigQuery",
-    schedule="@monthly",                 # Airflow 3 usa 'schedule'
+    schedule="@monthly",              # Airflow 3: use 'schedule'
     start_date=datetime(2020, 1, 1),
     catchup=True,
-    max_active_runs=1                   # use se quiser serializar execuções
+    max_active_runs=1
 )
 
 fetch_data_task = PythonOperator(
     task_id="fetch_openfda_data",
-    python_callable=fetch_openfda_data,   # sem provide_context
+    python_callable=fetch_openfda_data,  # sem provide_context
     dag=dag,
 )
 
@@ -186,11 +175,9 @@ bq_load = BigQueryInsertJobOperator(
                 CAST(JSON_VALUE(x, '$.events')     AS INT64) AS events
               FROM UNNEST(JSON_QUERY_ARRAY(@rows_json, '$')) AS x
             )
-            -- limpar janela alvo (idempotência)
             DELETE FROM `{{ params.project }}.{{ params.dataset }}.{{ params.table }}`
             WHERE week_start BETWEEN ws AND we;
 
-            -- inserir dados
             INSERT INTO `{{ params.project }}.{{ params.dataset }}.{{ params.table }}`
             (week_start, week_end, events, endpoint, window_start, window_end, ingested_at)
             SELECT
@@ -210,36 +197,4 @@ bq_load = BigQueryInsertJobOperator(
                 {
                     "name": "rows_json",
                     "parameterType": {"type": "STRING"},
-                    "parameterValue": {
-                        "value": "{{ ti.xcom_pull(task_ids='fetch_openfda_data', key='openfda_weekly')['rows'] | tojson }}",
-                    },
-                },
-                {
-                    "name": "window_start",
-                    "parameterType": {"type": "DATE"},
-                    "parameterValue": {
-                        "value": "{{ ti.xcom_pull(task_ids='fetch_openfda_data', key='openfda_weekly')['window_start'] }}",
-                    },
-                },
-                {
-                    "name": "window_end",
-                    "parameterType": {"type": "DATE"},
-                    "parameterValue": {
-                        "value": "{{ ti.xcom_pull(task_ids='fetch_openfda_data', key='openfda_weekly')['window_end'] }}",
-                    },
-                },
-                {
-                    "name": "endpoint",
-                    "parameterType": {"type": "STRING"},
-                    "parameterValue": {
-                        "value": "{{ ti.xcom_pull(task_ids='fetch_openfda_data', key='openfda_weekly')['endpoint'] }}",
-                    },
-                },
-            ],
-        }
-    },
-    params={"project": PROJECT_ID, "dataset": DATASET, "table": TABLE},
-    dag=dag,
-)
-
-fetch_data_task >> bq_create >> bq_load
+                    "param
