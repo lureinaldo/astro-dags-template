@@ -4,9 +4,9 @@ from __future__ import annotations
 from airflow.decorators import dag, task
 from airflow.providers.google.cloud.hooks.bigquery import BigQueryHook
 
+from google.cloud import bigquery
 import pendulum
 import pandas as pd
-import pandas_gbq
 import requests
 import time
 from datetime import date
@@ -37,7 +37,7 @@ SESSION.headers.update(
 
 # ========================= Helpers =========================
 def _search_expr_by_day(day: date, generic_name: str) -> str:
-    """Expressão de busca por dia para device/event."""
+    """Expressão de busca por dia para device/event (openFDA)."""
     d = day.strftime("%Y%m%d")
     # Campos: device.generic_name e date_received (endpoint device/event)
     return f'device.generic_name:"{generic_name}" AND date_received:{d}'
@@ -50,6 +50,7 @@ def _openfda_get(url: str, params: Dict[str, str]) -> Dict[str, Any]:
             return {"results": []}
         if 200 <= r.status_code < 300:
             return r.json()
+        # log simples de erro
         try:
             print("[openFDA][err]", r.status_code, r.json())
         except Exception:
@@ -88,6 +89,13 @@ def _to_flat_device(rows: List[Dict[str, Any]]) -> pd.DataFrame:
     df = df.drop_duplicates(subset=["report_number"], keep="first")
     return df
 
+def _ensure_dataset(client: bigquery.Client, project: str, dataset: str, location: str) -> None:
+    ds_id = f"{project}.{dataset}"
+    ds = bigquery.Dataset(ds_id)
+    ds.location = location
+    # exists_ok=True evita exceção se já existir
+    client.create_dataset(ds, exists_ok=True)
+
 # ========================= DAG =========================
 @dag(
     dag_id="openfda_cgm_stage_pipeline",
@@ -109,7 +117,7 @@ def openfda_cgm_stage_pipeline():
         ETL completo no mesmo task para evitar XCom grande:
         - Busca dia a dia, com paginação (limit=1000, skip)
         - Normaliza (flat)
-        - Grava STAGE no BigQuery com if_exists='replace'
+        - Grava STAGE no BigQuery com WRITE_TRUNCATE (idempotente)
         - Retorna metadados mínimos para o próximo task
         """
         base_url = "https://api.fda.gov/device/event.json"
@@ -140,42 +148,49 @@ def openfda_cgm_stage_pipeline():
             day = date.fromordinal(day.toordinal() + 1)
         print(f"[fetch] Jan–Jun/2020: {n_calls} chamadas, {len(all_rows)} registros no total.")
 
-        # Normaliza e grava STAGE
+        # Normaliza
         df = _to_flat_device(all_rows)
         print(f"[normalize] linhas pós-normalização: {len(df)}")
         if not df.empty:
             print("[normalize] preview:\n", df.head(10).to_string(index=False))
 
-        # Credenciais BigQuery
-        bq = BigQueryHook(gcp_conn_id=GCP_CONN_ID, location=BQ_LOCATION)
-        creds = bq.get_credentials()
+        # Cliente BigQuery
+        bq_hook = BigQueryHook(gcp_conn_id=GCP_CONN_ID, location=BQ_LOCATION)
+        client: bigquery.Client = bq_hook.get_client()
+        _ensure_dataset(client, GCP_PROJECT, BQ_DATASET, BQ_LOCATION)
 
         # Esquema da STAGE
         schema_stage = [
-            {"name": "report_number",     "type": "STRING"},
-            {"name": "date_received",     "type": "DATE"},
-            {"name": "event_type",        "type": "STRING"},
-            {"name": "device_generic",    "type": "STRING"},
-            {"name": "device_brand",      "type": "STRING"},
-            {"name": "manufacturer_name", "type": "STRING"},
-            {"name": "source_country",    "type": "STRING"},
+            bigquery.SchemaField("report_number",     "STRING"),
+            bigquery.SchemaField("date_received",     "DATE"),
+            bigquery.SchemaField("event_type",        "STRING"),
+            bigquery.SchemaField("device_generic",    "STRING"),
+            bigquery.SchemaField("device_brand",      "STRING"),
+            bigquery.SchemaField("manufacturer_name", "STRING"),
+            bigquery.SchemaField("source_country",    "STRING"),
         ]
 
-        # Grava STAGE, substituindo integralmente (idempotente)
+        # DataFrame vazio com colunas corretas, se necessário
         if df.empty:
-            df = pd.DataFrame(columns=[c["name"] for c in schema_stage])
+            df = pd.DataFrame({f.name: pd.Series(dtype="object") for f in schema_stage})
+            # Ajusta tipos básicos
+            df = df.astype({"date_received": "datetime64[ns]"}).assign(
+                date_received=lambda x: pd.NaT
+            )
 
-        pandas_gbq.to_gbq(
-            dataframe=df,
-            destination_table=f"{BQ_DATASET}.{BQ_TABLE_STAGE}",
-            project_id=GCP_PROJECT,
-            if_exists="replace",
-            credentials=creds,
-            table_schema=schema_stage,
-            location=BQ_LOCATION,
-            progress_bar=False,
+        table_id_stage = f"{GCP_PROJECT}.{BQ_DATASET}.{BQ_TABLE_STAGE}"
+        job_config_stage = bigquery.LoadJobConfig(
+            schema=schema_stage,
+            write_disposition=bigquery.WriteDisposition.WRITE_TRUNCATE,
         )
-        print(f"[stage] Gravados {len(df)} registros em {GCP_PROJECT}.{BQ_DATASET}.{BQ_TABLE_STAGE}.")
+        load_job = client.load_table_from_dataframe(
+            dataframe=df,
+            destination=table_id_stage,
+            job_config=job_config_stage,
+            location=BQ_LOCATION,
+        )
+        load_job.result()
+        print(f"[stage] Gravados {len(df)} registros em {table_id_stage}.")
 
         return {
             "start":  TEST_START.strftime("%Y-%m-%d"),
@@ -201,38 +216,47 @@ def openfda_cgm_stage_pipeline():
         ORDER BY day
         """
 
-        bq = BigQueryHook(gcp_conn_id=GCP_CONN_ID, location=BQ_LOCATION)
-        creds = bq.get_credentials()
+        # Cliente BigQuery
+        bq_hook = BigQueryHook(gcp_conn_id=GCP_CONN_ID, location=BQ_LOCATION)
+        client: bigquery.Client = bq_hook.get_client()
+        _ensure_dataset(client, GCP_PROJECT, BQ_DATASET, BQ_LOCATION)
 
-        # CORREÇÃO: usar parâmetro 'query' (não 'sql') e remover args opcionais frágeis
-        df_counts = pandas_gbq.read_gbq(
-            query=query_sql,
-            project_id=GCP_PROJECT,
-            credentials=creds,
-            location=BQ_LOCATION,
-        )
+        # Executa a consulta e converte para DataFrame
+        query_job = client.query(query_sql, location=BQ_LOCATION)
+        df_counts = query_job.result().to_dataframe(create_bqstorage_client=False)
 
         if df_counts.empty:
             print("[counts] Nenhuma linha para agregar.")
-            df_counts = pd.DataFrame(columns=["day", "events", "device_generic"])
+            df_counts = pd.DataFrame(
+                {"day": pd.Series(dtype="datetime64[ns]"),
+                 "events": pd.Series(dtype="int64"),
+                 "device_generic": pd.Series(dtype="object")}
+            )
 
         schema_counts = [
-            {"name": "day",            "type": "DATE"},
-            {"name": "events",         "type": "INTEGER"},
-            {"name": "device_generic", "type": "STRING"},
+            bigquery.SchemaField("day",            "DATE"),
+            bigquery.SchemaField("events",         "INTEGER"),
+            bigquery.SchemaField("device_generic", "STRING"),
         ]
 
-        pandas_gbq.to_gbq(
-            dataframe=df_counts,
-            destination_table=f"{BQ_DATASET}.{BQ_TABLE_COUNT}",
-            project_id=GCP_PROJECT,
-            if_exists="replace",
-            credentials=creds,
-            table_schema=schema_counts,
-            location=BQ_LOCATION,
-            progress_bar=False,
+        table_id_counts = f"{GCP_PROJECT}.{BQ_DATASET}.{BQ_TABLE_COUNT}"
+        job_config_counts = bigquery.LoadJobConfig(
+            schema=schema_counts,
+            write_disposition=bigquery.WriteDisposition.WRITE_TRUNCATE,
         )
-        print(f"[counts] {len(df_counts)} linhas gravadas em {GCP_PROJECT}.{BQ_DATASET}.{BQ_TABLE_COUNT}.")
+
+        # Ajusta tipo de 'day' para datetime, BigQuery converte para DATE
+        if not df_counts.empty:
+            df_counts["day"] = pd.to_datetime(df_counts["day"], errors="coerce")
+
+        load_job2 = client.load_table_from_dataframe(
+            dataframe=df_counts,
+            destination=table_id_counts,
+            job_config=job_config_counts,
+            location=BQ_LOCATION,
+        )
+        load_job2.result()
+        print(f"[counts] {len(df_counts)} linhas gravadas em {table_id_counts}.")
 
     build_daily_counts(extract_transform_load())
 
