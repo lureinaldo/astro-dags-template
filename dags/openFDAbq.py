@@ -1,30 +1,31 @@
 """
 OpenFDA (device/event - Continuous Glucose Monitors)
 DAG mensal: coleta diária do mês em execução, agrega por semana e grava no BigQuery.
-- Busca: https://api.fda.gov/device/event.json
+- Endpoint: https://api.fda.gov/device/event.json
 - Filtro: device.generic_name:"continuous glucose"
 - Janela: date_received:[YYYYMMDD TO YYYYMMDD]
-- Agregação: count=date_received  → soma semanal (W-MON)
+- Agregação: count=date_received → soma semanal (W-MON)
 - Saída intermediária: DataFrame → XCom (lista de dicts)
 - Persistência: BigQuery (cria dataset/tabela, limpa janela e insere)
 """
 
+from __future__ import annotations
+
 from airflow import DAG
-from airflow.operators.python import PythonOperator
+from airflow.operators.python import PythonOperator, get_current_context
 from airflow.providers.google.cloud.operators.bigquery import BigQueryInsertJobOperator
 from datetime import datetime, timedelta
 import pandas as pd
 import requests
-import pendulum
 
 # =========================
 # Parâmetros editáveis
 # =========================
-PROJECT_ID = "bigquery-471718"         # ex.: "meu-projeto"
-DATASET    = "openfda"                 # dataset de destino
-TABLE      = "cgm_device_events_weekly"
-LOCATION   = "US"                      # região do seu dataset (ex.: "US", "EU", "southamerica-east1")
-GCP_CONN_ID = "google_cloud_default"   # conn_id com chave JSON
+PROJECT_ID = "bigquery-471718"          # ajuste conforme seu projeto GCP
+DATASET    = "openfda"                  # dataset de destino
+TABLE      = "cgm_device_events_weekly" # tabela de destino
+LOCATION   = "US"                       # região do dataset (ex.: "US", "EU", "southamerica-east1")
+GCP_CONN_ID = "google_cloud_default"    # conn_id com chave JSON
 
 API_HOST = "https://api.fda.gov"
 ENDPOINT = "device/event.json"
@@ -35,20 +36,15 @@ GENERIC_NAME_QUERY = 'device.generic_name:%22continuous+glucose%22'  # Continuou
 # =========================
 def last_day_of_month(year: int, month: int) -> int:
     """Retorna o último dia do mês/ano informados."""
-    # regra segura: ir para o dia 28, somar 4 dias, voltar para o dia 1 e subtrair 1
-    d = datetime(year, month, 28) + timedelta(days=4)
-    return (d.replace(day=1) - timedelta(days=1)).day
-
-def yyyymmdd(d: datetime) -> str:
-    return d.strftime("%Y%m%d")
+    d = datetime(year, month, 28) + timedelta(days=4)   # cai no mês seguinte
+    return (d.replace(day=1) - timedelta(days=1)).day   # volta para o último dia do mês alvo
 
 # =========================
 # Monta URL de consulta
 # =========================
-def generate_query_url(year: int, month: int) -> str:
+def generate_query_url(year: int, month: int) -> tuple[str, str, str]:
     start_date = f"{year}{month:02d}01"
     end_date = f"{year}{month:02d}{last_day_of_month(year, month):02d}"
-    # device/event + filtro generic_name + janela por date_received + count diário
     query = (
         f"{API_HOST}/{ENDPOINT}"
         f"?search={GENERIC_NAME_QUERY}"
@@ -60,21 +56,21 @@ def generate_query_url(year: int, month: int) -> str:
 # =========================
 # Task: extrair e agregar semanal
 # =========================
-def fetch_openfda_data(**kwargs):
+def fetch_openfda_data() -> None:
     """
-    - Obtém o mês/ano da execução (execution_date).
-    - Consulta device/event com count=date_received.
-    - Converte para DataFrame, agrega por semana (W-MON) e publica no XCom.
-    XCom: lista de dicts com week_start, week_end, events, window_start, window_end.
+    Obtém o mês/ano do logical_date, consulta device/event com count=date_received,
+    agrega por semana (W-MON) e publica no XCom um dicionário com:
+      - rows: [{week_start, week_end, events}, ...]
+      - window_start, window_end, endpoint, filter
     """
-    ti = kwargs["ti"]
-    # Em DAG @monthly, execution_date representa o mês agendado
-    execution_date = kwargs["execution_date"]  # pendulum DateTime
-    year = execution_date.year
-    month = execution_date.month
+    ctx = get_current_context()
+    ti = ctx["ti"]
+    logical_date = ctx["logical_date"]  # pendulum DateTime
+    year = logical_date.year
+    month = logical_date.month
 
     url, start_yyyymmdd, end_yyyymmdd = generate_query_url(year, month)
-    resp = requests.get(url, timeout=3)
+    resp = requests.get(url, timeout=30)
     if resp.status_code != 200:
         ti.xcom_push(key="openfda_weekly", value=[])
         return
@@ -85,26 +81,20 @@ def fetch_openfda_data(**kwargs):
         ti.xcom_push(key="openfda_weekly", value=[])
         return
 
-    # DataFrame diário
     df = pd.DataFrame(results)  # colunas: ["time","count"]
-    # garantir parsing explícito (YYYYMMDD)
     df["time"] = pd.to_datetime(df["time"], format="%Y%m%d")
 
-    # Agregação semanal: W-MON (semanas terminando na 2a feira)
     weekly = (
         df.resample("W-MON", on="time")["count"]
           .sum()
           .reset_index()
           .rename(columns={"time": "week_end", "count": "events"})
     )
-    # Definir início da semana (6 dias antes do fim)
     weekly["week_start"] = weekly["week_end"] - pd.to_timedelta(6, unit="D")
 
-    # Metadados da janela (para idempotência na carga)
     window_start = f"{start_yyyymmdd[:4]}-{start_yyyymmdd[4:6]}-{start_yyyymmdd[6:]}"
     window_end   = f"{end_yyyymmdd[:4]}-{end_yyyymmdd[4:6]}-{end_yyyymmdd[6:]}"
 
-    # Normalizar tipos para JSON
     weekly_out = (
         weekly[["week_start", "week_end", "events"]]
         .assign(
@@ -114,7 +104,6 @@ def fetch_openfda_data(**kwargs):
         .to_dict(orient="records")
     )
 
-    # Publica no XCom
     ti.xcom_push(
         key="openfda_weekly",
         value={
@@ -127,7 +116,7 @@ def fetch_openfda_data(**kwargs):
     )
 
 # =========================
-# Task: criar dataset/tabela no BQ
+# Task: criar dataset/tabela no BigQuery
 # =========================
 def bq_create_sql() -> str:
     return f"""
@@ -147,7 +136,7 @@ def bq_create_sql() -> str:
     """
 
 # =========================
-# DAG
+# Definição da DAG (Airflow 3)
 # =========================
 default_args = {
     "owner": "airflow",
@@ -156,25 +145,22 @@ default_args = {
     "retry_delay": timedelta(minutes=5),
 }
 
-# Início em 2020-01-01 para cobrir desde 2020 (cada run processa seu próprio mês)
 dag = DAG(
     dag_id="openfda_cgm_weekly_to_bq",
     default_args=default_args,
     description="OpenFDA device/event (CGM) → weekly → BigQuery",
-    schedule="@monthly",
+    schedule="@monthly",                 # Airflow 3 usa 'schedule'
     start_date=datetime(2020, 1, 1),
     catchup=True,
-    max_active_tasks=1,
+    max_active_runs=1                   # use se quiser serializar execuções
 )
 
 fetch_data_task = PythonOperator(
     task_id="fetch_openfda_data",
-    python_callable=fetch_openfda_data,
-    provide_context=True,
+    python_callable=fetch_openfda_data,   # sem provide_context
     dag=dag,
 )
 
-# Criação de dataset/tabela
 bq_create = BigQueryInsertJobOperator(
     task_id="bq_create_objects",
     gcp_conn_id=GCP_CONN_ID,
@@ -183,7 +169,6 @@ bq_create = BigQueryInsertJobOperator(
     dag=dag,
 )
 
-# Carga idempotente: apaga a janela do mês e insere as linhas do XCom
 bq_load = BigQueryInsertJobOperator(
     task_id="bq_load_weekly",
     gcp_conn_id=GCP_CONN_ID,
@@ -226,7 +211,6 @@ bq_load = BigQueryInsertJobOperator(
                     "name": "rows_json",
                     "parameterType": {"type": "STRING"},
                     "parameterValue": {
-                        # converte o XCom (lista de dicts) para JSON
                         "value": "{{ ti.xcom_pull(task_ids='fetch_openfda_data', key='openfda_weekly')['rows'] | tojson }}",
                     },
                 },
