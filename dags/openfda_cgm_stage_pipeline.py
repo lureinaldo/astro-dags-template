@@ -136,4 +136,136 @@ def openfda_cgm_stage_pipeline():
                 }
                 payload = _openfda_get(base_url, params)
                 rows = payload.get("results", []) or []
-                all_rows.exte_
+                all_rows.extend(rows)
+                total_dia += len(rows)
+                n_calls += 1
+                if len(rows) < limit:
+                    break
+                skip += limit
+                time.sleep(0.25)  # respeita rate limit
+            print(f"[fetch] {day}: {total_dia} registros.")
+            day = date.fromordinal(day.toordinal() + 1)
+        print(f"[fetch] Jan–Jun/2020: {n_calls} chamadas, {len(all_rows)} registros no total.")
+
+        # Normaliza
+        df = _to_flat_device(all_rows)
+        print(f"[normalize] linhas pós-normalização: {len(df)}")
+        if not df.empty:
+            print("[normalize] preview:\n", df.head(10).to_string(index=False))
+
+        # Cliente BigQuery
+        bq_hook = BigQueryHook(gcp_conn_id=GCP_CONN_ID, location=BQ_LOCATION)
+        client: bigquery.Client = bq_hook.get_client()
+        _ensure_dataset(client, GCP_PROJECT, BQ_DATASET, BQ_LOCATION)
+
+        # Esquema da STAGE
+        schema_stage = [
+            bigquery.SchemaField("report_number",     "STRING"),
+            bigquery.SchemaField("date_received",     "DATE"),
+            bigquery.SchemaField("event_type",        "STRING"),
+            bigquery.SchemaField("device_generic",    "STRING"),
+            bigquery.SchemaField("device_brand",      "STRING"),
+            bigquery.SchemaField("manufacturer_name", "STRING"),
+            bigquery.SchemaField("source_country",    "STRING"),
+        ]
+
+        # Dropar tabela STAGE para remover propriedades antigas (idempotente)
+        table_id_stage = f"{GCP_PROJECT}.{BQ_DATASET}.{BQ_TABLE_STAGE}"
+        client.delete_table(table_id_stage, not_found_ok=True)
+
+        # DataFrame vazio com colunas corretas, se necessário
+        if df.empty:
+            df = pd.DataFrame({f.name: pd.Series(dtype="object") for f in schema_stage})
+            df["date_received"] = pd.to_datetime(pd.Series([], dtype="datetime64[ns]"))
+
+        job_config_stage = bigquery.LoadJobConfig(
+            schema=schema_stage,
+            write_disposition=bigquery.WriteDisposition.WRITE_TRUNCATE,
+        )
+        load_job = client.load_table_from_dataframe(
+            dataframe=df,
+            destination=table_id_stage,
+            job_config=job_config_stage,
+            location=BQ_LOCATION,
+        )
+        load_job.result()
+        print(f"[stage] Gravados {len(df)} registros em {table_id_stage}.")
+
+        return {
+            "start":  TEST_START.strftime("%Y-%m-%d"),
+            "end":    TEST_END.strftime("%Y-%m-%d"),
+            "generic": DEVICE_GENERIC,
+        }
+
+    @task(retries=0)
+    def build_daily_counts(meta: Dict[str, str]) -> None:
+        """
+        Agrega contagem diária a partir da STAGE e salva a tabela final particionada por event_date.
+        """
+        start, end, generic = meta["start"], meta["end"], meta["generic"]
+
+        query_sql = f"""
+        SELECT
+          date_received AS event_date,
+          COUNT(*)      AS events,
+          '{generic}'   AS device_generic
+        FROM `{GCP_PROJECT}.{BQ_DATASET}.{BQ_TABLE_STAGE}`
+        WHERE date_received BETWEEN DATE('{start}') AND DATE('{end}')
+        GROUP BY event_date
+        ORDER BY event_date
+        """
+
+        # Cliente BigQuery
+        bq_hook = BigQueryHook(gcp_conn_id=GCP_CONN_ID, location=BQ_LOCATION)
+        client: bigquery.Client = bq_hook.get_client()
+        _ensure_dataset(client, GCP_PROJECT, BQ_DATASET, BQ_LOCATION)
+
+        # Executa a consulta e converte para DataFrame
+        query_job = client.query(query_sql, location=BQ_LOCATION)
+        df_counts = query_job.result().to_dataframe(create_bqstorage_client=False)
+
+        if df_counts.empty:
+            print("[counts] Nenhuma linha para agregar.")
+            df_counts = pd.DataFrame(
+                {
+                    "event_date": pd.Series(dtype="datetime64[ns]"),
+                    "events": pd.Series(dtype="int64"),
+                    "device_generic": pd.Series(dtype="object"),
+                }
+            )
+        else:
+            # Garantir tipo datetime para conversão a DATE
+            df_counts["event_date"] = pd.to_datetime(df_counts["event_date"], errors="coerce")
+
+        schema_counts = [
+            bigquery.SchemaField("event_date",     "DATE"),
+            bigquery.SchemaField("events",         "INTEGER"),
+            bigquery.SchemaField("device_generic", "STRING"),
+        ]
+
+        table_id_counts = f"{GCP_PROJECT}.{BQ_DATASET}.{BQ_TABLE_COUNT}"
+
+        # **PONTO CRÍTICO**: remover a tabela antes para descartar partições antigas com campo diferente
+        client.delete_table(table_id_counts, not_found_ok=True)
+
+        job_config_counts = bigquery.LoadJobConfig(
+            schema=schema_counts,
+            write_disposition=bigquery.WriteDisposition.WRITE_TRUNCATE,
+            time_partitioning=bigquery.TimePartitioning(
+                type_=bigquery.TimePartitioningType.DAY,
+                field="event_date",   # o campo de partição EXISTE no schema acima
+            ),
+        )
+
+        load_job2 = client.load_table_from_dataframe(
+            dataframe=df_counts,
+            destination=table_id_counts,
+            job_config=job_config_counts,
+            location=BQ_LOCATION,
+        )
+        load_job2.result()
+        print(f"[counts] {len(df_counts)} linhas gravadas em {table_id_counts}.")
+
+    build_daily_counts(extract_transform_load())
+
+openfda_cgm_stage_pipeline()
