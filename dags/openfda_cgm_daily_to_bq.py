@@ -1,5 +1,22 @@
 from __future__ import annotations
 
+"""
+OpenFDA (device/event → Continuous Glucose Monitors)
+Coleta mensal (contagens diárias por date_received), limita a jan–jun/2020
+e persiste no BigQuery usando apenas DDL (sem DML), compatível com Sandbox.
+
+Tabela alvo:
+  {PROJECT_ID}.{DATASET}.{TABLE} (
+      event_date   DATE,
+      events       INT64,
+      endpoint     STRING,
+      window_start DATE,
+      window_end   DATE,
+      ingested_at  TIMESTAMP
+  )
+Particionamento: DATE_TRUNC(event_date, MONTH)
+"""
+
 from datetime import datetime, timedelta
 import json
 import requests
@@ -112,4 +129,108 @@ def prepare_bq_job_config_daily() -> None:
             DECLARE we DATE DEFAULT @window_end;
 
             /* Recria a tabela substituindo somente a janela [ws..we] */
-            CREATE OR REPLACE TABLE `{PROJECT
+            CREATE OR REPLACE TABLE `{PROJECT_ID}.{DATASET}.{TABLE}`
+            PARTITION BY DATE_TRUNC(event_date, MONTH)
+            AS
+            -- preserva dados fora da janela
+            SELECT event_date, events, endpoint, window_start, window_end, ingested_at
+            FROM `{PROJECT_ID}.{DATASET}.{TABLE}`
+            WHERE event_date < ws OR event_date > we
+
+            UNION ALL
+            -- insere dados da janela atual a partir do JSON
+            SELECT
+              CAST(JSON_VALUE(j, '$.date')   AS DATE)  AS event_date,
+              CAST(JSON_VALUE(j, '$.events') AS INT64) AS events,
+              @endpoint                                  AS endpoint,
+              ws                                         AS window_start,
+              we                                         AS window_end,
+              CURRENT_TIMESTAMP()                        AS ingested_at
+            FROM UNNEST(JSON_QUERY_ARRAY(@rows_json)) AS j
+            WHERE CAST(JSON_VALUE(j, '$.date') AS DATE) BETWEEN ws AND we;
+            """,
+            "queryParameters": [
+                {"name": "rows_json",    "parameterType": {"type": "STRING"}, "parameterValue": {"value": rows_json}},
+                {"name": "window_start", "parameterType": {"type": "DATE"},   "parameterValue": {"value": window_start}},
+                {"name": "window_end",   "parameterType": {"type": "DATE"},   "parameterValue": {"value": window_end}},
+                {"name": "endpoint",     "parameterType": {"type": "STRING"}, "parameterValue": {"value": endpoint}},
+            ],
+        }
+    }
+
+    ti.xcom_push(key="bq_job_config_daily", value=configuration)
+
+# =========================
+# DDL inicial (dataset/tabela vazia)
+# =========================
+def bq_create_sql_daily() -> str:
+    return f"""
+    CREATE SCHEMA IF NOT EXISTS `{PROJECT_ID}.{DATASET}`
+    OPTIONS(location = '{LOCATION}');
+
+    CREATE TABLE IF NOT EXISTS `{PROJECT_ID}.{DATASET}.{TABLE}` (
+      event_date   DATE,
+      events       INT64,
+      endpoint     STRING,
+      window_start DATE,
+      window_end   DATE,
+      ingested_at  TIMESTAMP
+    )
+    PARTITION BY DATE_TRUNC(event_date, MONTH);
+    """
+
+# =========================
+# Definição da DAG (Airflow 3)
+# =========================
+default_args = {
+    "owner": "airflow",
+    "depends_on_past": False,
+    "retries": 1,
+    "retry_delay": timedelta(minutes=5),
+}
+
+dag = DAG(
+    dag_id="openfda_cgm_daily_to_bq",
+    default_args=default_args,
+    description="OpenFDA device/event (CGM) → contagens diárias (jan–jun/2020) → BigQuery (sem DML)",
+    schedule="@monthly",
+    start_date=datetime(2020, 1, 1),
+    end_date=datetime(2020, 6, 30),  # limita a janeiro–junho de 2020
+    catchup=True,
+    max_active_runs=1,
+)
+
+# =========================
+# Tarefas
+# =========================
+fetch_daily = PythonOperator(
+    task_id="fetch_openfda_daily",
+    python_callable=fetch_openfda_daily,
+    dag=dag,
+)
+
+prepare_bq_job = PythonOperator(
+    task_id="prepare_bq_job_config_daily",
+    python_callable=prepare_bq_job_config_daily,
+    dag=dag,
+)
+
+bq_create = BigQueryInsertJobOperator(
+    task_id="bq_create_objects",
+    gcp_conn_id=GCP_CONN_ID,
+    location=LOCATION,
+    configuration={"query": {"query": bq_create_sql_daily(), "useLegacySql": False}},
+    dag=dag,
+)
+
+bq_load_daily = BigQueryInsertJobOperator(
+    task_id="bq_load_daily",
+    gcp_conn_id=GCP_CONN_ID,
+    location=LOCATION,
+    configuration=XComArg(prepare_bq_job, key="bq_job_config_daily"),
+    dag=dag,
+)
+
+# Encadeamento
+fetch_daily >> prepare_bq_job
+[prepare_bq_job, bq_create] >> bq_load_daily
