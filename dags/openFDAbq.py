@@ -74,7 +74,7 @@ def fetch_openfda_data(**kwargs):
     month = execution_date.month
 
     url, start_yyyymmdd, end_yyyymmdd = generate_query_url(year, month)
-    resp = requests.get(url, timeout=30)
+    resp = requests.get(url, timeout=3)
     if resp.status_code != 200:
         ti.xcom_push(key="openfda_weekly", value=[])
         return
