@@ -33,7 +33,7 @@ GENERIC_NAME_QUERY = 'device.generic_name:%22continuous+glucose%22'
 
 # =========================
 # Utilidades de datas
-# ==========================
+# =========================
 def last_day_of_month(year: int, month: int) -> int:
     d = datetime(year, month, 28) + timedelta(days=4)
     return (d.replace(day=1) - timedelta(days=1)).day
@@ -197,4 +197,36 @@ bq_load = BigQueryInsertJobOperator(
                 {
                     "name": "rows_json",
                     "parameterType": {"type": "STRING"},
-                    "param
+                    "parameterValue": {
+                        "value": "{{ ti.xcom_pull(task_ids='fetch_openfda_data', key='openfda_weekly')['rows'] | tojson }}",
+                    },
+                },
+                {
+                    "name": "window_start",
+                    "parameterType": {"type": "DATE"},
+                    "parameterValue": {
+                        "value": "{{ ti.xcom_pull(task_ids='fetch_openfda_data', key='openfda_weekly')['window_start'] }}",
+                    },
+                },
+                {
+                    "name": "window_end",
+                    "parameterType": {"type": "DATE"},
+                    "parameterValue": {
+                        "value": "{{ ti.xcom_pull(task_ids='fetch_openfda_data', key='openfda_weekly')['window_end'] }}",
+                    },
+                },
+                {
+                    "name": "endpoint",
+                    "parameterType": {"type": "STRING"},
+                    "parameterValue": {
+                        "value": "{{ ti.xcom_pull(task_ids='fetch_openfda_data', key='openfda_weekly')['endpoint'] }}",
+                    },
+                },
+            ],
+        }
+    },
+    params={"project": PROJECT_ID, "dataset": DATASET, "table": TABLE},
+    dag=dag,
+)
+
+fetch_data_task >> bq_create >> bq_load
