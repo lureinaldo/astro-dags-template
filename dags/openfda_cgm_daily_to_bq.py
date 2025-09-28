@@ -85,6 +85,9 @@ def fetch_openfda_daily() -> None:
 
 # ========= Monta config do job BQ → XCom =========
 def prepare_bq_job_config_daily() -> None:
+    from airflow.operators.python import get_current_context
+    import json
+
     ctx = get_current_context()
     ti = ctx["ti"]
 
@@ -101,24 +104,26 @@ def prepare_bq_job_config_daily() -> None:
             "useLegacySql": False,
             "parameterMode": "NAMED",
             "query": f"""
+            -- parâmetros de janela
             DECLARE ws DATE DEFAULT @window_start;
             DECLARE we DATE DEFAULT @window_end;
 
-            WITH src AS (
-              SELECT
-                CAST(JSON_VALUE(j, '$.date')   AS DATE)  AS event_date,
-                CAST(JSON_VALUE(j, '$.events') AS INT64) AS events
-              FROM UNNEST(JSON_QUERY_ARRAY(@rows_json)) AS j
-            )
-            -- limpeza idempotente da janela alvo (mês lógico)
+            -- 1) limpeza idempotente da janela alvo
             DELETE FROM `{PROJECT_ID}.{DATASET}.{TABLE}`
             WHERE event_date BETWEEN ws AND we;
 
+            -- 2) inserção diária a partir do JSON (sem CTE)
             INSERT INTO `{PROJECT_ID}.{DATASET}.{TABLE}`
-            (event_date, events, endpoint, window_start, window_end, ingested_at)
-            SELECT s.event_date, s.events, @endpoint, ws, we, CURRENT_TIMESTAMP()
-            FROM src s
-            WHERE s.event_date BETWEEN ws AND we;
+              (event_date, events, endpoint, window_start, window_end, ingested_at)
+            SELECT
+              CAST(JSON_VALUE(j, '$.date')   AS DATE)  AS event_date,
+              CAST(JSON_VALUE(j, '$.events') AS INT64) AS events,
+              @endpoint,
+              ws,
+              we,
+              CURRENT_TIMESTAMP()
+            FROM UNNEST(JSON_QUERY_ARRAY(@rows_json)) AS j
+            WHERE CAST(JSON_VALUE(j, '$.date') AS DATE) BETWEEN ws AND we;
             """,
             "queryParameters": [
                 {"name": "rows_json",    "parameterType": {"type": "STRING"}, "parameterValue": {"value": rows_json}},
