@@ -33,7 +33,7 @@ GENERIC_NAME_QUERY = 'device.generic_name:%22continuous+glucose%22'
 
 # =========================
 # Utilidades de datas
-# =========================
+# ==========================
 def last_day_of_month(year: int, month: int) -> int:
     d = datetime(year, month, 28) + timedelta(days=4)
     return (d.replace(day=1) - timedelta(days=1)).day
